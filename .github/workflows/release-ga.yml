@@ -1,0 +1,174 @@
+# GA タグ (v1.0.0 など) の push で起動する。
+# ビルドは一切行わない (deploy many)。やることは検証と昇格だけ。
+#
+#   1. 同一バージョンの最新 RC タグを特定し、GA タグと同一コミットであることを検証
+#   2. バックエンド: crane tag で RC イメージの digest にそのまま GA タグを追加
+#      (再ビルドなし・digest 不変を検証)
+#   3. フロントエンド: RC の Release アセットをダウンロードし、
+#      チェックサム検証のうえ GA Release に再添付
+#   4. production へデプロイ (Environment の必須レビュアー承認で停止する)
+name: Release GA
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  id-token: write
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  ga:
+    # タグパターンが RC にもマッチするため、RC はここで除外する
+    if: ${{ !contains(github.ref_name, '-rc.') }}
+    runs-on: ubuntu-latest
+    environment: production # ここで必須レビュアーの承認待ちになる
+    env:
+      TAG: ${{ github.ref_name }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find matching RC & verify same commit
+        id: rc
+        run: |
+          GA_COMMIT=$(git rev-list -n 1 "${TAG}")
+          RC_TAG=$(git tag -l "${TAG}-rc.*" --sort=-v:refname | head -n 1)
+          if [ -z "${RC_TAG}" ]; then
+            echo "::error::対応する RC タグが見つからない。GA の前に必ず RC を経ること (規約: リリース手順)"
+            exit 1
+          fi
+          RC_COMMIT=$(git rev-list -n 1 "${RC_TAG}")
+          if [ "${GA_COMMIT}" != "${RC_COMMIT}" ]; then
+            echo "::error::GA タグ (${GA_COMMIT}) と ${RC_TAG} (${RC_COMMIT}) のコミットが一致しない。GA タグは検証済み RC と同一コミットに打つこと"
+            exit 1
+          fi
+          echo "rc_tag=${RC_TAG}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: imjasonh/setup-crane@v0.4
+
+      - name: Promote backend image (再ビルドなし)
+        id: promote
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          RC_TAG: ${{ steps.rc.outputs.rc_tag }}
+        run: |
+          aws ecr get-login-password | crane auth login "${REGISTRY}" -u AWS --password-stdin
+          RC_DIGEST=$(crane digest "${REGISTRY}/${ECR_REPOSITORY}:${RC_TAG}")
+          crane tag "${REGISTRY}/${ECR_REPOSITORY}:${RC_TAG}" "${TAG}"
+          GA_DIGEST=$(crane digest "${REGISTRY}/${ECR_REPOSITORY}:${TAG}")
+          if [ "${RC_DIGEST}" != "${GA_DIGEST}" ]; then
+            echo "::error::digest が RC と一致しない (RC=${RC_DIGEST}, GA=${GA_DIGEST})"
+            exit 1
+          fi
+          echo "RC と GA は同一 digest: ${GA_DIGEST}"
+          echo "digest=${GA_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${REGISTRY}/${ECR_REPOSITORY}@${GA_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Download RC frontend artifact & verify checksum
+        env:
+          RC_TAG: ${{ steps.rc.outputs.rc_tag }}
+        run: |
+          gh release download "${RC_TAG}" \
+            -p 'dist-*.tar.gz' -p 'checksums.txt' -p 'release-manifest.json'
+          sha256sum -c checksums.txt
+          mkdir -p site
+          tar -xzf dist-*.tar.gz -C site
+
+      # 自動生成ノート (What's Changed) の差分基準タグを決める。
+      #
+      # GitHub は既定で「直前のリリース」を基準に差分を作る。GA (v1.0.0) の直前は
+      # 同一コミットの RC (v1.0.0-rc.1) なので、既定に任せると「RC からの差分 = 空」
+      # のノートになってしまう。そこで基準を直前の *GA* タグに固定する。
+      #
+      # git tag -l 'v[0-9]*' --sort=-v:refname で新しい順に並べ、-rc. を除外し、
+      # 今回の GA タグの 1 つ後ろ (= 1 つ前のバージョン) を取る。
+      # 初回 GA では前の GA が存在しないため空になる。その場合は
+      # --notes-start-tag を付けず、GitHub の既定 (最初のコミットから) に任せる。
+      - name: Resolve previous GA tag (notes の差分基準)
+        id: prev
+        run: |
+          GA_TAGS=$(git tag -l 'v[0-9]*' --sort=-v:refname | grep -v -- '-rc\.' || true)
+          PREV_GA=$(awk -v cur="${TAG}" 'found { print; exit } $0 == cur { found = 1 }' <<< "${GA_TAGS}")
+          if [ -n "${PREV_GA}" ]; then
+            echo "自動生成ノートの差分基準: ${PREV_GA} .. ${TAG}"
+          else
+            echo "直前の GA タグが無い (初回 GA)。差分基準は GitHub の既定に任せる"
+          fi
+          echo "prev_ga=${PREV_GA}" >> "$GITHUB_OUTPUT"
+
+      # --notes と --generate-notes は併用でき、--notes の本文のあとに生成ノートが
+      # 続く。RC からの昇格である旨と digest は、トレーサビリティのために残す。
+      - name: Create GA release (RC のアセットをそのまま再利用)
+        env:
+          RC_TAG: ${{ steps.rc.outputs.rc_tag }}
+          PREV_GA: ${{ steps.prev.outputs.prev_ga }}
+        run: |
+          NOTES_ARGS=(--generate-notes)
+          if [ -n "${PREV_GA}" ]; then
+            NOTES_ARGS+=(--notes-start-tag "${PREV_GA}")
+          fi
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --notes "Promoted from ${RC_TAG} (同一アーティファクト)。Backend digest: \`${{ steps.promote.outputs.digest }}\`" \
+            "${NOTES_ARGS[@]}" \
+            dist-*.tar.gz checksums.txt release-manifest.json
+
+      - name: Deploy backend to production (digest 参照)
+        run: |
+          aws lambda update-function-code \
+            --function-name "${FUNCTION_NAME}" \
+            --image-uri "${{ steps.promote.outputs.image_uri }}"
+          aws lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
+          aws lambda update-function-configuration \
+            --function-name "${FUNCTION_NAME}" \
+            --environment "Variables={APP_ENV=production,IMAGE_DIGEST=${{ steps.promote.outputs.digest }}}"
+          aws lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
+
+      # tar は RC のビルド時の mtime を復元する。aws s3 sync は「サイズが同じで、かつ
+      # ローカルが新しくない」ファイルをスキップするため、S3 に載っているものの方が
+      # 新しい状況 (ロールバック後の GA 再実行など) では、サイズの変わらない
+      # index.html だけが取り残される。JS はファイル名が変わるので新規に上がり、
+      # --delete で旧 JS は消える → 古い index.html が消えた JS を参照して真っ白になる。
+      # mtime を今に揃えて、必ず全ファイルを上書きさせる。
+      - name: Deploy frontend to production
+        env:
+          BUCKET: ${{ vars.S3_BUCKET }}
+        run: |
+          find site -type f -exec touch {} +
+          aws s3 sync site "s3://${BUCKET}" --delete
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"
+
+      # 壊れているのは S3 に残った方なので、実際に載った index.html を取得して突き合わせる
+      - name: Verify deployed index.html
+        env:
+          BUCKET: ${{ vars.S3_BUCKET }}
+        run: |
+          aws s3 cp "s3://${BUCKET}/index.html" deployed-index.html
+          if ! cmp -s site/index.html deployed-index.html; then
+            echo "::error::S3 の index.html が配布物と一致しない (sync に取り残された)"
+            exit 1
+          fi
+
+      - name: Show production URL
+        run: echo "production => ${{ vars.APP_URL }}"

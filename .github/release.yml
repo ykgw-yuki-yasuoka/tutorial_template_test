@@ -1,0 +1,27 @@
+# 自動生成リリースノート (Automatically generated release notes) のカテゴリ定義。
+#
+# gh release create --generate-notes で生成される「What's Changed」を、PR に
+# 付いたラベルでカテゴリ分けする。ラベルは .github/workflows/pr-label.yml が
+# PR タイトルのプレフィックスから自動付与する。
+#
+#   feat:  -> type: feat -> 🚀 Features
+#   fix:   -> type: fix  -> 🐛 Bug Fixes
+#   その他 -> type: <type> -> 🧹 Maintenance / Other
+#
+# ラベル名は Conventional Commits の type と 1:1 ("type: feat")。GitHub 既定の
+# enhancement / bug は使わない (理由は pr-label.yml の冒頭)。
+#
+# NOTE: 上から順に評価され、最初に一致したカテゴリにだけ入る。
+#       "*" は「どのカテゴリにも一致しなかった PR」を受ける catch-all なので、
+#       必ず最後に置くこと。ラベルの付いていない PR もここに入る。
+changelog:
+  categories:
+    - title: 🚀 Features
+      labels:
+        - "type: feat"
+    - title: 🐛 Bug Fixes
+      labels:
+        - "type: fix"
+    - title: 🧹 Maintenance / Other
+      labels:
+        - "*"

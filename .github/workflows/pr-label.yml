@@ -1,0 +1,98 @@
+# PR タイトルの Conventional Commits プレフィックスから、対応するラベルを付ける。
+#
+# ラベルはリリースノートのカテゴリ分けの材料になる (.github/release.yml)。
+# 人手で付けるとカテゴリ分けが「付け忘れ」で簡単に崩れるため、CI が
+# 唯一の正 (= PR タイトル) からラベルを導出する。
+#
+# ラベル名は type と 1:1 にする (feat -> "type: feat")。GitHub 既定の
+# enhancement / bug は流用しない。名前が規約の type とずれていると、
+# ラベルを見た人が「どのプレフィックスから来たのか」を頭の中で変換する必要があり、
+# 変換表を知らない人には対応が読み取れない。ラベルが type そのものなら、
+# PR タイトル -> ラベル -> リリースノートのカテゴリが一本の線で追える。
+#
+# ラベル名は 3 か所で揃えること:
+#   - このワークフロー (プレフィックス -> ラベル名)
+#   - scripts/setup-github.sh (ラベルの実体を作る)
+#   - .github/release.yml (ラベル -> ノートのカテゴリ)
+name: PR Label
+
+on:
+  pull_request:
+    # edited: タイトルを直したらラベルも付け替わってほしい。
+    # synchronize: push のたびに、あるべき状態へ収束させる (取りこぼしの保険)。
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write # ラベルの付け外しに必要
+
+# タイトルを連続で編集したときに、古い実行が後から勝たないようにする。
+concurrency:
+  group: pr-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # NOTE: このジョブは必須ステータスチェックには含めない
+  # (setup-github.sh の STATUS_CHECK_CONTEXTS は ci.yml のジョブ名と一致させる)。
+  # 規約を守らせるのは pr-title ジョブの仕事で、ここはその結果をラベルに写すだけ。
+  label:
+    name: pr-label
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      # タイトルは env 経由で渡す。${{ }} で run に直接埋め込むと、
+      # タイトルに書かれた文字列がそのままシェルとして解釈されてしまう。
+      PR_TITLE: ${{ github.event.pull_request.title }}
+    steps:
+      - name: Sync label with title prefix
+        run: |
+          # このワークフローが管理する type。ci.yml の pr-title ジョブが許可する
+          # 一覧と同じものを並べる。ここに無いラベル (手で付けたものなど) には触れない。
+          TYPES=(feat fix docs refactor perf test build ci chore revert)
+
+          # "feat(api)!: 日本語の subject" -> "feat"
+          TYPE=$(printf '%s' "${PR_TITLE}" | sed -nE 's/^([a-zA-Z]+)(\([^)]*\))?!?:.*/\1/p' | tr '[:upper:]' '[:lower:]')
+
+          # ラベル名は type そのもの ("feat" -> "type: feat")。変換表は要らない。
+          WANT=""
+          for T in "${TYPES[@]}"; do
+            if [ "${T}" = "${TYPE}" ]; then
+              WANT="type: ${T}"
+              break
+            fi
+          done
+
+          # プレフィックスが規約外。ここで既存ラベルを剥がすと、pr-title の
+          # 失敗を直す前にラベルまで消えて混乱するので、何もせず抜ける。
+          # (規約違反そのものは ci.yml の pr-title ジョブが落として知らせる)
+          if [ -z "${WANT}" ]; then
+            echo "::warning::PR タイトルから Conventional Commits のプレフィックスを取得できませんでした: ${PR_TITLE}"
+            exit 0
+          fi
+
+          CURRENT=$(gh pr view "${PR_NUMBER}" --json labels -q '.labels[].name')
+
+          # 付け替え: タイトルが変わったら、前のプレフィックス由来のラベルを外す。
+          # 外さないと feat -> fix に直したときに "type: feat" と "type: fix" が
+          # 併存し、リリースノートで 2 か所に出てしまう。
+          for T in "${TYPES[@]}"; do
+            LABEL="type: ${T}"
+            if [ "${LABEL}" != "${WANT}" ] && grep -qxF "${LABEL}" <<< "${CURRENT}"; then
+              echo "remove: ${LABEL}"
+              gh pr edit "${PR_NUMBER}" --remove-label "${LABEL}"
+            fi
+          done
+
+          if grep -qxF "${WANT}" <<< "${CURRENT}"; then
+            echo "already labeled: ${WANT}"
+            exit 0
+          fi
+
+          # ラベルは scripts/setup-github.sh が作る。作られていないリポジトリでも
+          # ここでコケて PR 全体を赤くしないよう、警告に留める。
+          echo "add: ${WANT}"
+          if ! gh pr edit "${PR_NUMBER}" --add-label "${WANT}"; then
+            echo "::warning::ラベル '${WANT}' を付与できませんでした。リポジトリに存在しない可能性があります (./scripts/setup-github.sh を実行してください)"
+          fi

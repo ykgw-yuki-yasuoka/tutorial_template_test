@@ -1,0 +1,84 @@
+# main へ push (= PR の squash merge) されるたびに dev 環境へ自動デプロイする。
+# トランクの先端が常に dev で動いている状態を作る。
+name: CD (dev)
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write # OIDC で AWS ロールを assume するために必要
+  contents: read
+
+concurrency:
+  group: cd-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev # GitHub Environment。OIDC の sub が environment:dev になる
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push backend image
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_TAG="sha-${SHORT_SHA}"
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker build \
+            --build-arg APP_VERSION=dev \
+            --build-arg GIT_SHA="${GITHUB_SHA}" \
+            -t "${IMAGE}" backend
+          docker push "${IMAGE}"
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${IMAGE_TAG}" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${REGISTRY}/${ECR_REPOSITORY}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy backend (Lambda, digest 参照)
+        run: |
+          aws lambda update-function-code \
+            --function-name "${FUNCTION_NAME}" \
+            --image-uri "${{ steps.build.outputs.image_uri }}"
+          aws lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
+          aws lambda update-function-configuration \
+            --function-name "${FUNCTION_NAME}" \
+            --environment "Variables={APP_ENV=dev,IMAGE_DIGEST=${{ steps.build.outputs.digest }}}"
+          aws lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          APP_VERSION: dev
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Deploy frontend (S3 + CloudFront)
+        run: |
+          aws s3 sync frontend/dist "s3://${{ vars.S3_BUCKET }}" --delete
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"
+
+      - name: Show deployed URL
+        run: echo "dev => ${{ vars.APP_URL }}"

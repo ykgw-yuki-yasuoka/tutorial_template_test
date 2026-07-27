@@ -1,0 +1,160 @@
+# production を過去の GA タグへ戻す。手動起動 (workflow_dispatch)。
+#
+# build once の世界では、ロールバックは「昔のアーティファクトを再デプロイする」だけ。
+# したがってこのワークフローにも docker build / npm build は存在しない。GA と同じく
+# 「既にあるもの」を指し直すだけで、新しい Release も作らない (contents: read で足りる)。
+#
+#   1. 戻し先タグが GA であることを検証 (RC・未リリースのタグには戻せない)
+#   2. バックエンド: そのタグの ECR digest を引き、digest 参照でデプロイ
+#   3. フロントエンド: その GA Release のアセットを取得し、チェックサム検証のうえ S3 へ
+#
+# NOTE: ECR のタグは IMMUTABLE、GitHub のタグと Release も Ruleset で保護されている。
+#       つまり「v1.0.0 が指す中身」は出荷時から動かない。ロールバック先が
+#       出荷したものと同一である保証は、この不変性がそのまま担っている。
+name: Rollback production
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "戻し先の GA タグ (例: v1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read # Release は作らない。読むだけ
+
+# GA デプロイと同じグループ。リリース中のロールバック (またはその逆) が
+# 交差して、production に中途半端な組み合わせが載るのを防ぐ
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production # ここで必須レビュアーの承認待ちになる
+    env:
+      TAG: ${{ inputs.tag }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # タグの存在確認に全履歴が必要
+
+      # production に載せてよいのは GA だけ、という規約はロールバックでも変わらない。
+      # 「緊急時だから RC に戻す」を許すと、承認ゲートを通っていないものが本番に出る
+      - name: Verify target is a released GA tag
+        run: |
+          if [[ "${TAG}" == *-rc.* ]]; then
+            echo "::error::RC タグ (${TAG}) には戻せない。production に載せてよいのは GA だけ"
+            exit 1
+          fi
+
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::タグ ${TAG} が存在しない"
+            exit 1
+          fi
+
+          if ! PRERELEASE=$(gh release view "${TAG}" --json isPrerelease -q .isPrerelease 2>/dev/null); then
+            echo "::error::${TAG} の Release が無い。GA として出荷されたタグにしか戻せない"
+            exit 1
+          fi
+          if [ "${PRERELEASE}" != "false" ]; then
+            echo "::error::${TAG} は Pre-release。production に載せてよいのは GA だけ"
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 再ビルドしない。GA のときに push されたイメージの digest を引き直すだけ
+      - name: Resolve backend image digest (再ビルドなし)
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          if ! DIGEST=$(aws ecr describe-images \
+                --repository-name "${ECR_REPOSITORY}" \
+                --image-ids imageTag="${TAG}" \
+                --query 'imageDetails[0].imageDigest' --output text 2>/dev/null); then
+            echo "::error::ECR に ${TAG} のイメージが無い"
+            exit 1
+          fi
+          echo "${TAG} のイメージ: ${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${REGISTRY}/${ECR_REPOSITORY}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # GA Release に添付されているのは RC がビルドした tar.gz そのもの。
+      # ファイル名も RC のまま (dist-v1.0.0-rc.1.tar.gz) なので glob で取る
+      - name: Download frontend artifact & verify checksum (再ビルドなし)
+        run: |
+          gh release download "${TAG}" -p 'dist-*.tar.gz' -p 'checksums.txt'
+          sha256sum -c checksums.txt
+          mkdir -p site
+          tar -xzf dist-*.tar.gz -C site
+
+      - name: Deploy backend to production (digest 参照)
+        run: |
+          aws lambda update-function-code \
+            --function-name "${FUNCTION_NAME}" \
+            --image-uri "${{ steps.image.outputs.image_uri }}"
+          aws lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
+          aws lambda update-function-configuration \
+            --function-name "${FUNCTION_NAME}" \
+            --environment "Variables={APP_ENV=production,IMAGE_DIGEST=${{ steps.image.outputs.digest }}}"
+          aws lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
+
+      # aws s3 sync は「サイズが同じで、かつローカルが新しくない」ファイルをスキップする。
+      # tar は tar.gz を作った時点 (= RC のビルド時) の mtime を復元するため、
+      # ロールバックではローカル側が必ず「今 S3 に載っているもの」より古くなる。
+      # index.html はバージョンが変わってもバイト数が変わらない (参照する JS 名の
+      # ハッシュ長が同じ) ので、そのままではスキップされてしまう。一方 JS は
+      # ファイル名が変わるので新規に上がり、--delete で旧 JS は消える。結果、
+      # 古い index.html が消えた JS を参照して、本番が真っ白になる。
+      # mtime を今に揃えて、必ず全ファイルを上書きさせる。
+      - name: Deploy frontend to production
+        env:
+          BUCKET: ${{ vars.S3_BUCKET }}
+        run: |
+          find site -type f -exec touch {} +
+          aws s3 sync site "s3://${BUCKET}" --delete
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"
+
+      # 取りこぼしは「デプロイは成功、サイトは真っ白」という形で出る (index.html だけが
+      # 古いまま残り、それが参照する JS は --delete で消えている)。ローカルの index.html を
+      # 見ても気付けない — 壊れているのは S3 に残った方なので、実際に載ったものを取得して
+      # バイトで突き合わせる
+      - name: Verify deployed index.html
+        env:
+          BUCKET: ${{ vars.S3_BUCKET }}
+        run: |
+          aws s3 cp "s3://${BUCKET}/index.html" deployed-index.html
+          if ! cmp -s site/index.html deployed-index.html; then
+            echo "::error::S3 の index.html が配布物と一致しない (sync に取り残された)"
+            exit 1
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Rollback"
+            echo ""
+            echo "production を **${TAG}** に戻しました (再ビルドなし)。"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| backend image digest | \`${{ steps.image.outputs.digest }}\` |"
+            echo "| production | ${{ vars.APP_URL }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,157 @@
+# RC タグ (v1.0.0-rc.1 など) の push で起動する。
+# ここが唯一のビルドポイント (build once)。GA では一切再ビルドしない。
+#
+#   1. タグが release/* ブランチ上のコミットであることを検証
+#   2. バックエンド: イメージを 1 回だけビルドし、RC タグ付きで ECR へ push
+#   3. フロントエンド: 1 回だけビルドし、tar.gz + チェックサムを
+#      GitHub Release (Pre-release) のアセットとして保存
+#   4. staging へデプロイ (イメージは digest 参照)
+#
+# NOTE: アプリに焼き込むバージョンは "-rc.N" を除いた基底バージョン。
+#       RC と GA でアーティファクトが同一である、という規約をコードで表現している。
+name: Release RC
+
+on:
+  push:
+    tags:
+      - "v[0-9]*-rc.[0-9]*"
+
+permissions:
+  id-token: write
+  contents: write # Release 作成に必要
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  rc:
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      TAG: ${{ github.ref_name }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # ブランチ包含チェックに全履歴が必要
+
+      # 落ちる原因はタグ側とは限らない。release ブランチが origin に push されて
+      # いなければ、正しいコミットに打ったタグでもここで落ちる (どのリモート
+      # ブランチにも含まれないため)。どちらなのかログで区別できるようにする。
+      - name: Verify tag points to a release/* branch
+        run: |
+          TAG_COMMIT=$(git rev-list -n 1 "${TAG}")
+          # 空マッチの grep は 1 を返す。set -e で黙って落ちないよう || true で受ける
+          BRANCHES=$(git branch -r --contains "${TAG_COMMIT}" --format='%(refname:short)' \
+                     | grep '^origin/' || true)
+
+          if grep -qE '^origin/release/' <<<"${BRANCHES}"; then
+            exit 0
+          fi
+
+          # release ブランチを push し忘れた場合、その先端は main と同じコミットなので
+          # 一覧には origin/main だけが出る。「タグを打つ場所を間違えた」と区別が
+          # つかないため、どちらであっても push 漏れの確認を促す。
+          echo "::error::RC タグは release/* ブランチ上のコミットに打つこと (規約: リリースブランチ運用)"
+          echo "タグ ${TAG} のコミット ${TAG_COMMIT} を含む origin のブランチ: $(tr '\n' ' ' <<<"${BRANCHES:-(なし)}")"
+          echo "release ブランチを origin に push し忘れていませんか? push すれば、このタグは"
+          echo "打ち直さずに済みます (同じコミットのままなので、失敗した実行を Re-run するだけ):"
+          echo "  git switch release/vX.Y && git push -u origin release/vX.Y"
+          exit 1
+
+      - name: Derive base version
+        id: ver
+        run: |
+          BASE_TAG="${TAG%-rc.*}"            # v1.0.0
+          echo "base=${BASE_TAG#v}" >> "$GITHUB_OUTPUT"   # 1.0.0
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push backend image (build once)
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+          docker build \
+            --build-arg APP_VERSION="${{ steps.ver.outputs.base }}" \
+            --build-arg GIT_SHA="${GITHUB_SHA}" \
+            -t "${IMAGE}" backend
+          docker push "${IMAGE}"
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${TAG}" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${REGISTRY}/${ECR_REPOSITORY}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Build frontend (build once)
+        working-directory: frontend
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.base }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Package frontend artifact & manifest
+        id: artifact
+        run: |
+          ASSET="dist-${TAG}.tar.gz"
+          tar -czf "${ASSET}" -C frontend/dist .
+          sha256sum "${ASSET}" > checksums.txt
+          FRONTEND_SHA256=$(cut -d' ' -f1 checksums.txt | head -n1)
+          cat > release-manifest.json <<EOF
+          {
+            "tag": "${TAG}",
+            "git_sha": "${GITHUB_SHA}",
+            "backend_image_digest": "${{ steps.build.outputs.digest }}",
+            "frontend_asset": "${ASSET}",
+            "frontend_sha256": "${FRONTEND_SHA256}"
+          }
+          EOF
+          echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
+
+      # --generate-notes で「What's Changed」(マージ済み PR の一覧) を GitHub に
+      # 生成させる。カテゴリ分けは .github/release.yml のラベル定義に従う。
+      # --notes と併用でき、--notes の本文のあとに生成ノートが続く。digest は
+      # トレーサビリティ (この Release がどのイメージか) のために本文へ残す。
+      - name: Create Pre-release with artifacts
+        run: |
+          gh release create "${TAG}" \
+            --prerelease \
+            --title "${TAG}" \
+            --notes "Release candidate. Backend digest: \`${{ steps.build.outputs.digest }}\`" \
+            --generate-notes \
+            "${{ steps.artifact.outputs.asset }}" checksums.txt release-manifest.json
+
+      - name: Deploy backend to staging (digest 参照)
+        run: |
+          aws lambda update-function-code \
+            --function-name "${FUNCTION_NAME}" \
+            --image-uri "${{ steps.build.outputs.image_uri }}"
+          aws lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
+          aws lambda update-function-configuration \
+            --function-name "${FUNCTION_NAME}" \
+            --environment "Variables={APP_ENV=staging,IMAGE_DIGEST=${{ steps.build.outputs.digest }}}"
+          aws lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
+
+      - name: Deploy frontend to staging
+        run: |
+          aws s3 sync frontend/dist "s3://${{ vars.S3_BUCKET }}" --delete
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"
+
+      - name: Show staging URL
+        run: echo "staging => ${{ vars.APP_URL }}"

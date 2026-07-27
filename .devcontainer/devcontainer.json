@@ -1,0 +1,74 @@
+{
+  "name": "git-workflow-tutorial",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+
+  // node は CI (.github/workflows/ci.yml) に合わせて固定する。
+  // ズレると「手元では通るのに CI で落ちる」が起きる。
+  // python は os-provided (Ubuntu 24.04 の 3.12) を使う。
+  // バージョンを明示するとソースからのビルドになり、初回起動が数分遅くなる。
+  // backend の実行環境はどのみち uv sync が作る .venv 側。
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    // installTools を切る: 既定で pylint/flake8/mypy/black が入るが、
+    // このリポジトリの Python チェックは uv 経由の ruff だけ。
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "os-provided",
+      "installTools": false
+    },
+    "ghcr.io/devcontainers/features/terraform:1": { "version": "latest" },
+    "ghcr.io/devcontainers/features/aws-cli:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    // scripts/bootstrap-image.sh が docker build / docker push する
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+
+  // uv は公式 feature が無いので post-create.sh で入れる
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  // type=bind はソースが無いと docker run ごと失敗するので、先に作っておく。
+  // (docker run -v と違い自動作成されない)
+  "initializeCommand": "mkdir -p ${localEnv:HOME}/.aws",
+
+  // ローカルの VS Code + Docker 向け。ホストの ~/.aws を読み取り専用で見せる。
+  // Codespaces では空なので、その場合は下の remoteEnv 経由 (Codespaces secrets) を使う。
+  "mounts": [
+    "source=${localEnv:HOME}/.aws,target=/home/vscode/.aws,type=bind,readonly"
+  ],
+
+  // 注意: ${localEnv:X} はホストで X が未設定のとき「空文字列」に展開される
+  // (仕様: Unset variables are left blank)。行が消えるのではなく X="" が注入されるため、
+  // AWS CLI は「空のプロファイル名/リージョン名」を使おうとして失敗する。
+  //   The config profile () could not be found / https://sts..amazonaws.com
+  // 「空なら注入しない」とは書けないので、コンテナ側の shell-env.sh で受け止めて unset する。
+  // AWS_REGION だけは既定値構文でも埋められるが、他と揃えて shell-env.sh 側でも面倒を見る。
+  "remoteEnv": {
+    "AWS_ACCESS_KEY_ID": "${localEnv:AWS_ACCESS_KEY_ID}",
+    "AWS_SECRET_ACCESS_KEY": "${localEnv:AWS_SECRET_ACCESS_KEY}",
+    "AWS_SESSION_TOKEN": "${localEnv:AWS_SESSION_TOKEN}",
+    "AWS_REGION": "${localEnv:AWS_REGION:ap-northeast-1}",
+    "AWS_PROFILE": "${localEnv:AWS_PROFILE}"
+  },
+
+  // 非対話 bash (bash -c / VS Code のタスク / 自作スクリプト) は ~/.bashrc を読まない
+  // (Ubuntu の ~/.bashrc は冒頭で「非対話なら return」する)。BASH_ENV は非対話 bash が
+  // 起動時に読むファイルなので、ここから上記の空 AWS_* の除去を効かせる。
+  // 対話 bash / ログインシェル / zsh 向けの仕込みは post-create.sh 側。
+  // 指すファイルが無くても bash は黙って無視するため、ビルド前でも安全。
+  "containerEnv": {
+    "BASH_ENV": "${containerWorkspaceFolder}/.devcontainer/shell-env.sh"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "charliermarsh.ruff",
+        "ms-python.python",
+        "hashicorp.terraform",
+        "github.vscode-github-actions"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/bin/python"
+      }
+    }
+  }
+}

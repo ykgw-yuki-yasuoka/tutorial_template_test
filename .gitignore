@@ -1,0 +1,22 @@
+# Node
+node_modules/
+frontend/dist/
+frontend/public/version.json
+
+# Python
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+
+# misc
+.DS_Store
+.claude/
+credentials/

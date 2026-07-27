@@ -1,0 +1,175 @@
+{
+  "_comment": [
+    "テンプレート。scripts/gen-setup-policy.sh が __PREFIX__ と __OWNER__ を置換して、",
+    "参加者ごとの最小権限ポリシーを生成する。このファイルをそのまま IAM に登録しないこと。",
+    "  __PREFIX__ = <project_name>-<owner>  (例: gitflow-tutorial-alice) -- リソース名",
+    "  __OWNER__  = <owner>                 (例: alice)                  -- Owner タグの値",
+    "IAM は不明なトップレベルキーを受け付けないため、生成時にこの _comment は削除される。",
+    "許可内容の解説は docs/00-setup.md の「必要な権限」を参照。"
+  ],
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Identity",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcrAuthToken",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcrRepository",
+      "Effect": "Allow",
+      "Action": "ecr:*",
+      "Resource": "arn:aws:ecr:*:*:repository/__PREFIX__-backend"
+    },
+    {
+      "Sid": "S3FrontendBuckets",
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::__PREFIX__-*-frontend-*",
+        "arn:aws:s3:::__PREFIX__-*-frontend-*/*"
+      ]
+    },
+    {
+      "Sid": "LambdaFunctions",
+      "Effect": "Allow",
+      "Action": "lambda:*",
+      "Resource": "arn:aws:lambda:*:*:function:__PREFIX__-*"
+    },
+
+    {
+      "Sid": "CloudFrontReadOnlyUnscopable",
+      "Effect": "Allow",
+      "Action": [
+        "cloudfront:ListDistributions",
+        "cloudfront:ListOriginAccessControls",
+        "cloudfront:GetCachePolicy",
+        "cloudfront:GetOriginRequestPolicy",
+        "cloudfront:GetDistribution",
+        "cloudfront:GetDistributionConfig"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudFrontCreateDistributionTaggedAsMine",
+      "Effect": "Allow",
+      "Action": "cloudfront:CreateDistribution",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/Owner": "__OWNER__"
+        }
+      }
+    },
+    {
+      "Sid": "CloudFrontTagDistributionAsMine",
+      "Effect": "Allow",
+      "Action": "cloudfront:TagResource",
+      "Resource": "arn:aws:cloudfront::*:distribution/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/Owner": "__OWNER__"
+        }
+      }
+    },
+    {
+      "Sid": "CloudFrontOwnDistributionsOnly",
+      "Effect": "Allow",
+      "Action": [
+        "cloudfront:UpdateDistribution",
+        "cloudfront:DeleteDistribution",
+        "cloudfront:CreateInvalidation",
+        "cloudfront:ListTagsForResource",
+        "cloudfront:UntagResource"
+      ],
+      "Resource": "arn:aws:cloudfront::*:distribution/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/Owner": "__OWNER__"
+        }
+      }
+    },
+    {
+      "Sid": "CloudFrontOriginAccessControlUnscopable",
+      "Effect": "Allow",
+      "Action": [
+        "cloudfront:CreateOriginAccessControl",
+        "cloudfront:GetOriginAccessControl",
+        "cloudfront:GetOriginAccessControlConfig",
+        "cloudfront:UpdateOriginAccessControl",
+        "cloudfront:DeleteOriginAccessControl"
+      ],
+      "Resource": "*"
+    },
+
+    {
+      "Sid": "IamRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:GetRole",
+        "iam:DeleteRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:ListRoleTags",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:GetRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::*:role/__PREFIX__-*"
+    },
+    {
+      "Sid": "IamAttachLambdaBasicExecutionOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::*:role/__PREFIX__-*",
+      "Condition": {
+        "ArnEquals": {
+          "iam:PolicyARN": "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        }
+      }
+    },
+    {
+      "Sid": "IamPassRoleToLambdaOnly",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::*:role/__PREFIX__-lambda-exec",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "lambda.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "IamGithubOidcProviderRead",
+      "Effect": "Allow",
+      "Action": "iam:GetOpenIDConnectProvider",
+      "Resource": "arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com"
+    },
+    {
+      "Sid": "CleanupLogGroupsList",
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "*"
+    },
+    {
+      "Sid": "CleanupLogGroups",
+      "Effect": "Allow",
+      "Action": "logs:DeleteLogGroup",
+      "Resource": "arn:aws:logs:*:*:log-group:/aws/lambda/__PREFIX__-*"
+    }
+  ]
+}

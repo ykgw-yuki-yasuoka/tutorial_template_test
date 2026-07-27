@@ -1,0 +1,103 @@
+# PR に対する CI。
+# ジョブ名 (pr-title / frontend / backend) は Rulesets の
+# required_status_checks の context と一致させているため、変更時は
+# scripts/setup-github.sh の STATUS_CHECK_CONTEXTS も更新すること。
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "release/**"
+    # タイトルの修正は edited で発火する。squash merge では PR タイトルが
+    # そのままコミットメッセージになるため、タイトルを直しても pr-title が
+    # 再実行されないと規約違反のまま merge できてしまう。
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # PR タイトルが Conventional Commits に従うかを検証する。
+  # squash merge 時に PR タイトルがそのままコミットメッセージになるため、
+  # ここで守れば main の履歴が規約準拠になる。
+  pr-title:
+    name: pr-title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          # 日本語 subject を許可(大文字小文字チェックを無効化)
+          subjectPattern: ^.+$
+
+  # scripts/ と .devcontainer/ の shell を静的検査する。
+  # これらは GitHub の保護設定を書き換えたり ECR へ push したりするため、
+  # レビューだけに頼らず機械的に弾けるものは弾く。
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # shellcheck は GitHub の ubuntu ランナーに同梱されている
+      - run: shellcheck --version
+      # -x: source されるファイル (scripts/lib/preflight.sh) も追跡する
+      - run: shellcheck -x scripts/*.sh scripts/lib/*.sh .devcontainer/*.sh
+      # shellcheck は構文しか見ないため、実行ビットの欠落は素通りする。
+      # README と docs は ./scripts/xxx.sh 形式で直接実行を案内しているので、
+      # 落ちていると clone した全員が Permission denied で止まる。
+      # scripts/lib/ は source 専用、.devcontainer/post-create.sh は
+      # devcontainer.json が bash 経由で呼ぶため、どちらも対象外。
+      - name: エントリポイントに実行ビットがあるか
+        run: |
+          MISSING=0
+          for f in scripts/*.sh; do
+            if [ ! -x "$f" ]; then
+              echo "::error file=${f}::実行ビットがありません (git update-index --chmod=+x ${f})"
+              MISSING=1
+            fi
+          done
+          exit "${MISSING}"
+
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # NOTE: 初回セットアップ後に package-lock.json をコミットしたら
+      # `npm ci` + setup-node の cache 設定へ切り替えることを推奨
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+
+  backend:
+    name: backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run pytest
