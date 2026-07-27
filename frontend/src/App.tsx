@@ -141,6 +141,7 @@ export default function App() {
           「build once / deploy many」が守られている証拠です。
         </p>
       </footer>
+      <p>環境: {env}</p>
     </main>
   );
 }
